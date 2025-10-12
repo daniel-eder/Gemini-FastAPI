@@ -10,7 +10,7 @@ from gemini_webapi.types import Gem
 
 from ..models import Message
 from ..utils import g_config
-from ..utils.helper import add_tag, save_file_to_tempfile, save_url_to_tempfile
+from ..utils.helper import save_file_to_tempfile, save_url_to_tempfile
 
 XML_WRAP_HINT = "\nFor any xml block, e.g. tool call, always wrap it with: \n`````xml\n...\n`````\n"
 
@@ -60,7 +60,7 @@ class GeminiClientWrapper(GeminiClient):
 
     @staticmethod
     async def process_message(
-        message: Message, tempdir: Path | None = None, tagged: bool = True
+        message: Message, tempdir: Path | None = None
     ) -> tuple[str, list[Path | str]]:
         """
         Process a single message and return model input.
@@ -99,20 +99,6 @@ class GeminiClientWrapper(GeminiClient):
                     else:
                         raise ValueError("File must contain 'file_data' key")
 
-        # This is a workaround for Gemini Web's displaying issues with XML blocks.
-        # Add this for tool calling
-        if re.search(r"<\s*[^>]+>", model_input):
-            hint = XML_WRAP_HINT
-        else:
-            hint = ""
-
-        # Add role tag if needed
-        if model_input:
-            if tagged:
-                model_input = add_tag(message.role, model_input + hint)
-            else:
-                model_input += hint
-
         return model_input, files
 
     @staticmethod
@@ -123,25 +109,15 @@ class GeminiClientWrapper(GeminiClient):
         Process the entire conversation and return a formatted string and list of
         files. The last message is assumed to be the assistant's response.
         """
-        # Determine once whether we need to wrap messages with role tags: only required
-        # if the history already contains assistant/system messages. When every message
-        # so far is from the user, we can skip tagging entirely.
-        need_tag = any(m.role != "user" for m in messages)
-
         conversation: list[str] = []
         files: list[Path | str] = []
 
         for msg in messages:
             input_part, files_part = await GeminiClientWrapper.process_message(
-                msg, tempdir, tagged=need_tag
+                msg, tempdir
             )
             conversation.append(input_part)
             files.extend(files_part)
-
-        # Append an opening assistant tag only when we used tags above so that Gemini
-        # knows where to start its reply.
-        if need_tag:
-            conversation.append(add_tag("assistant", "", unclose=True))
 
         return "\n".join(conversation), files
 
