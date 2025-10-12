@@ -130,12 +130,12 @@ async def create_chat_completion(
             response = await _send_with_split(session, model_input, files=files, stream=False)
 
             # Format the response from API
-            model_output = GeminiClientWrapper.extract_output(response, include_thoughts=True)
-            stored_output = GeminiClientWrapper.extract_output(response, include_thoughts=False)
+            model_output = GeminiClientWrapper.extract_output(response, include_thoughts=False)
+            thoughts = response.thoughts if hasattr(response, 'thoughts') else None
 
             # After formatting, persist the conversation to LMDB
             try:
-                last_message = Message(role="assistant", content=stored_output)
+                last_message = Message(role="assistant", content=model_output)
                 cleaned_history = db.sanitize_assistant_messages(request.messages)
                 conv = ConversationInStore(
                     model=model.model_name,
@@ -150,7 +150,7 @@ async def create_chat_completion(
                 logger.warning(f"Failed to save conversation to LMDB: {e}")
 
             return _create_standard_response(
-                model_output, completion_id, timestamp, request.model, request.messages
+                model_output, thoughts, completion_id, timestamp, request.model, request.messages
             )
 
     except Exception as e:
@@ -315,50 +315,31 @@ def _create_streaming_response(
         # Stream chunks from Gemini API
         try:
             async for chunk in stream_iterator:
-                # Extract delta text and thoughts from the chunk
-                delta_content = ""
+                # Build the delta object following OpenAI's format
+                delta = {}
                 
+                # Handle thoughts (reasoning) separately using reasoning_content
                 if chunk.delta_thoughts:
                     full_thoughts += chunk.delta_thoughts
-                    # Include thoughts in the stream if present
-                    if not full_text and not delta_content:
-                        # First chunk with thoughts - add the opening tag
-                        delta_content = f"<think>{chunk.delta_thoughts}"
-                    else:
-                        delta_content = chunk.delta_thoughts
+                    delta["reasoning_content"] = chunk.delta_thoughts
                 
+                # Handle regular text content
                 if chunk.delta_text:
                     # Format the text before sending
                     formatted_text = GeminiClientWrapper.format_stream_text(chunk.delta_text)
-                    
-                    # If we had thoughts and now have text, close the think tag
-                    if full_thoughts and not full_text:
-                        delta_content += "</think>\n" + formatted_text
-                    else:
-                        delta_content += formatted_text
+                    delta["content"] = formatted_text
                     full_text += chunk.delta_text  # Store unformatted for token counting
 
-                # Send the delta if we have content
-                if delta_content:
+                # Send the delta if we have any content (thoughts or text)
+                if delta:
                     data = {
                         "id": completion_id,
                         "object": "chat.completion.chunk",
                         "created": created_time,
                         "model": model,
-                        "choices": [{"index": 0, "delta": {"content": delta_content}, "finish_reason": None}],
+                        "choices": [{"index": 0, "delta": delta, "finish_reason": None}],
                     }
                     yield f"data: {orjson.dumps(data).decode('utf-8')}\n\n"
-
-            # Close thoughts tag if it wasn't closed yet
-            if full_thoughts and not full_text:
-                data = {
-                    "id": completion_id,
-                    "object": "chat.completion.chunk",
-                    "created": created_time,
-                    "model": model,
-                    "choices": [{"index": 0, "delta": {"content": "</think>\n"}, "finish_reason": None}],
-                }
-                yield f"data: {orjson.dumps(data).decode('utf-8')}\n\n"
 
         except Exception as e:
             logger.exception(f"Error during streaming: {e}")
@@ -405,16 +386,22 @@ def _create_streaming_response(
 
 def _create_standard_response(
     model_output: str,
+    thoughts: str | None,
     completion_id: str,
     created_time: int,
     model: str,
     messages: list[Message],
 ) -> dict:
-    """Create standard response"""
+    """Create standard response with OpenAI-compatible reasoning_content field"""
     # Calculate token usage
     prompt_tokens = sum(estimate_tokens(_text_from_message(msg)) for msg in messages)
     completion_tokens = estimate_tokens(model_output)
     total_tokens = prompt_tokens + completion_tokens
+
+    # Build the message with content and optionally reasoning_content
+    message = {"role": "assistant", "content": model_output}
+    if thoughts:
+        message["reasoning_content"] = thoughts
 
     result = {
         "id": completion_id,
@@ -424,7 +411,7 @@ def _create_standard_response(
         "choices": [
             {
                 "index": 0,
-                "message": {"role": "assistant", "content": model_output},
+                "message": message,
                 "finish_reason": "stop",
             }
         ],
