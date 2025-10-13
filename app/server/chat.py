@@ -137,8 +137,12 @@ async def create_chat_completion(
             try:
                 last_message = Message(role="assistant", content=model_output)
                 cleaned_history = db.sanitize_assistant_messages(request.messages)
+
+                # Defensive: ensure model is a valid string. Use model.model_name
+                # if available, otherwise fall back to the original request.model.
+                model_name_to_store = model.model_name if getattr(model, "model_name", None) else request.model
                 conv = ConversationInStore(
-                    model=model.model_name,
+                    model=str(model_name_to_store),
                     client_id=client.id,
                     metadata=session.metadata,
                     messages=[*cleaned_history, last_message],
@@ -354,8 +358,17 @@ def _create_streaming_response(
         try:
             last_message = Message(role="assistant", content=full_text)
             cleaned_history = db.sanitize_assistant_messages(messages)
+
+            # Ensure the model field is always a valid string. session.metadata
+            # may contain None values, so prefer a non-empty string from
+            # metadata[0] and fall back to the provided `model` parameter.
+            if session.metadata and len(session.metadata) > 0 and session.metadata[0]:
+                saved_model = session.metadata[0]
+            else:
+                saved_model = model
+
             conv = ConversationInStore(
-                model=session.metadata[0] if session.metadata else model,
+                model=str(saved_model),
                 client_id=client.id,
                 metadata=session.metadata,
                 messages=[*cleaned_history, last_message],
