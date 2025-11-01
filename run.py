@@ -7,8 +7,6 @@ from loguru import logger
 from app.main import create_app
 from app.utils import g_config, setup_logging
 
-app = create_app()
-
 if __name__ == "__main__":
     # Setup loguru logging (env overrides: GEMINI_LOG_LEVEL, GEMINI_LOG_JSON)
     json_logging = os.getenv("GEMINI_LOG_JSON", "false").lower() in {"1", "true", "yes"}
@@ -23,6 +21,14 @@ if __name__ == "__main__":
     if reload_enabled:
         logger.info("Hot reload enabled (GEMINI_RELOAD=true). Uvicorn will watch for file changes.")
 
+    # Decide application target for uvicorn
+    if reload_enabled:
+        # Use import string for reload compatibility
+        uvicorn_app = "app.main:create_app"
+    else:
+        # Instantiate once when not reloading
+        uvicorn_app = create_app()
+
     # Check HTTPS configuration
     if g_config.server.https.enabled:
         key_path = g_config.server.https.key_file
@@ -35,17 +41,18 @@ if __name__ == "__main__":
 
         logger.info(f"Starting server at https://{g_config.server.host}:{g_config.server.port} ...")
         uvicorn.run(
-            app,
+            uvicorn_app,
             host=g_config.server.host,
             port=g_config.server.port,
             log_config=None,
             ssl_keyfile=key_path,
             ssl_certfile=cert_path,
+            reload=reload_enabled,
         )
     else:
         logger.info(f"Starting server at http://{g_config.server.host}:{g_config.server.port} ...")
         uvicorn.run(
-            app,
+            uvicorn_app,
             host=g_config.server.host,
             port=g_config.server.port,
             log_config=None,
