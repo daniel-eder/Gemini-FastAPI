@@ -4,6 +4,7 @@ server:
   host: "0.0.0.0"          # Server bind address
   port: 8000               # Server port
   api_key: null            # API key for authentication (null for no auth)
+  reload: true            # Enable auto-reload (development only). Overridden by GEMINI_RELOAD env var if set.
   https:
     enabled: false                     # Enable HTTPS
     key_file: "certs/privkey.pem"      # SSL private key file path

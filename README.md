@@ -110,6 +110,25 @@ If you experience a 200 response with no tokens received from the client:
 
 To narrow logs to a single request, filter on its `request_id`.
 
+### Hot Reload Development
+
+For rapid iteration while editing Python files you can enable Uvicorn's reload mode:
+
+```powershell
+$env:GEMINI_RELOAD = 'true'
+uv run python run.py
+```
+
+This watches files and restarts the server automatically. The `watchfiles` package is included for efficient change detection.
+
+You can also set it in `config/config.yaml` under `server.reload: true`. Environment variable `GEMINI_RELOAD` overrides the config value if both are set.
+
+Notes:
+- Reload is for local development only; disable it in production.
+- State in memory (e.g. active Gemini sessions) will be recreated after each restart.
+- If you frequently edit cookie/config values, consider environment overrides plus reload for quick validation.
+- Use JSON logging plus reload for structured iterative debugging: `GEMINI_LOG_JSON=true`.
+
 ## Docker Deployment
 
 ### Run with Options

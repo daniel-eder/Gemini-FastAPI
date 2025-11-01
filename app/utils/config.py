@@ -31,6 +31,10 @@ class ServerConfig(BaseModel):
         description="API key for authentication, if set, will enable API key validation",
     )
     https: HTTPSConfig = Field(default=HTTPSConfig(), description="HTTPS configuration")
+    reload: bool = Field(
+        default=False,
+        description="Enable uvicorn auto-reload (development only). Can be overridden by GEMINI_RELOAD env var.",
+    )
 
 
 class GeminiClientSettings(BaseModel):

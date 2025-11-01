@@ -393,6 +393,18 @@ def _create_streaming_response(
         total_thought_chars = 0
         try:
             async for chunk in stream_iterator:
+                # Raw chunk debug (safe representation)
+                try:
+                    stream_logger.debug(
+                        "Upstream raw chunk",
+                        extra={
+                            "has_text": bool(getattr(chunk, 'delta_text', None)),
+                            "has_thoughts": bool(getattr(chunk, 'delta_thoughts', None)),
+                            "raw_keys": list(chunk.__dict__.keys()),
+                        },
+                    )
+                except Exception:
+                    stream_logger.debug("Failed to introspect upstream chunk structure")
                 # Build the delta object following OpenAI's format
                 delta = {}
                 

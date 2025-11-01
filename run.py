@@ -14,6 +14,15 @@ if __name__ == "__main__":
     json_logging = os.getenv("GEMINI_LOG_JSON", "false").lower() in {"1", "true", "yes"}
     setup_logging(level=g_config.logging.level, json=json_logging)
 
+    # Determine reload precedence: env overrides config
+    env_reload = os.getenv("GEMINI_RELOAD")
+    if env_reload is not None:
+        reload_enabled = env_reload.lower() in {"1", "true", "yes"}
+    else:
+        reload_enabled = bool(getattr(g_config.server, "reload", False))
+    if reload_enabled:
+        logger.info("Hot reload enabled (GEMINI_RELOAD=true). Uvicorn will watch for file changes.")
+
     # Check HTTPS configuration
     if g_config.server.https.enabled:
         key_path = g_config.server.https.key_file
@@ -40,4 +49,5 @@ if __name__ == "__main__":
             host=g_config.server.host,
             port=g_config.server.port,
             log_config=None,
+            reload=reload_enabled,
         )
