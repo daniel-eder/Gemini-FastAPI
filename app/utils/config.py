@@ -62,6 +62,10 @@ class GeminiConfig(BaseModel):
         ge=1,
         description="Maximum characters Gemini Web can accept per request",
     )
+    streaming_fallback: bool = Field(
+        default=True,
+        description="Automatically retry with non-stream response if streaming yields zero chunks.",
+    )
 
 
 class CORSConfig(BaseModel):

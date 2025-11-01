@@ -100,6 +100,23 @@ Streaming-specific instrumentation has been added. Each request is tagged with a
 - Final streaming metrics (total chunks, chars, elapsed ms) and token usage
 - Warning if the upstream produced **zero streaming chunks** (`Streaming ended with zero chunks ...`)
 
+#### Automatic Zero-Chunk Fallback
+
+If streaming produces no chunks (often due to upstream session hiccups) the server can automatically retry once using a non-stream request and emit that response as a single synthetic stream chunk.
+
+Configuration:
+
+| Option | Type | Default | Description |
+|--------|------|---------|-------------|
+| `gemini.streaming_fallback` | YAML config | `true` | Enable automatic non-stream retry when zero streaming chunks are received |
+| `GEMINI_STREAM_FALLBACK` | env var | overrides config | Set to `true/1/yes` or `false/0/no` to force enable/disable at runtime |
+
+Log messages:
+- `Streaming ended with zero chunks...` followed (if enabled) by `Attempting non-stream fallback after zero chunks.`
+- `Fallback succeeded; emitted synthetic chunk (chars=...)` or an error/empty warning.
+
+If fallback is disabled you still receive the end marker with zero completion tokens.
+
 If you experience a 200 response with no tokens received from the client:
 
 1. Check for the zero-chunk warning in logs

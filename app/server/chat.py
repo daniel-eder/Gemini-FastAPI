@@ -1,5 +1,6 @@
 import uuid
 import time
+import os
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -165,6 +166,8 @@ async def create_chat_completion(
                 session,
                 client,
                 request_id,
+                model_input,
+                files,
             )
         else:
             # For non-streaming, get the full response
@@ -353,6 +356,8 @@ def _create_streaming_response(
     session: ChatSession,
     client: GeminiClientWrapper,
     request_id: str,
+    original_model_input: str,
+    original_files: list[Path | str] | None,
 ) -> StreamingResponse:
     """Create streaming response with `usage` calculation included in the final chunk.
     
@@ -447,33 +452,74 @@ def _create_streaming_response(
             stream_logger.warning(
                 "Streaming ended with zero chunks received from upstream Gemini API. Check upstream connectivity or request formatting."
             )
+            # Determine fallback enablement
+            env_fb = os.getenv("GEMINI_STREAM_FALLBACK")
+            if env_fb is not None:
+                fallback_enabled = env_fb.lower() in {"1", "true", "yes"}
+            else:
+                fallback_enabled = getattr(g_config.gemini, "streaming_fallback", True)
+
+            if fallback_enabled:
+                stream_logger.debug("Attempting non-stream fallback after zero chunks.")
+                try:
+                    # Perform a non-stream send using the original final input (already split if needed earlier)
+                    fallback_response = await session.send_message(original_model_input, files=original_files)
+                    # Extract output
+                    fb_text = GeminiClientWrapper.extract_output(fallback_response, include_thoughts=False)
+                    if fb_text:
+                        full_text = fb_text  # replace empty content
+                        # Emit as a single synthetic chunk
+                        data_fb = {
+                            "id": completion_id,
+                            "object": "chat.completion.chunk",
+                            "created": created_time,
+                            "model": model,
+                            "choices": [
+                                {
+                                    "index": 0,
+                                    "delta": {"content": fb_text},
+                                    "finish_reason": None,
+                                }
+                            ],
+                        }
+                        yield f"data: {orjson.dumps(data_fb).decode('utf-8')}\n\n"
+                        chunk_count = 1
+                        total_text_chars = len(fb_text)
+                        stream_logger.debug(
+                            f"Fallback succeeded; emitted synthetic chunk (chars={total_text_chars})."
+                        )
+                    else:
+                        stream_logger.warning("Fallback response contained no text.")
+                except Exception as fe:
+                    stream_logger.exception(f"Fallback attempt failed: {fe}")
 
         # Calculate token usage
         prompt_tokens = sum(estimate_tokens(_text_from_message(msg)) for msg in messages)
         completion_tokens = estimate_tokens(full_text)
         total_tokens = prompt_tokens + completion_tokens
 
-        # Save conversation to LMDB after streaming completes
+        # Save conversation to LMDB after streaming completes (only if we have any assistant content)
         try:
-            last_message = Message(role="assistant", content=full_text)
-            cleaned_history = db.sanitize_assistant_messages(messages)
-
-            # Ensure the model field is always a valid string. session.metadata
-            # may contain None values, so prefer a non-empty string from
-            # metadata[0] and fall back to the provided `model` parameter.
-            if session.metadata and len(session.metadata) > 0 and session.metadata[0]:
-                saved_model = session.metadata[0]
+            if full_text:
+                last_message = Message(role="assistant", content=full_text)
+                cleaned_history = db.sanitize_assistant_messages(messages)
+                # Ensure the model field is always a valid string. session.metadata may contain None values.
+                if session.metadata and len(session.metadata) > 0 and session.metadata[0]:
+                    saved_model = session.metadata[0]
+                else:
+                    saved_model = model
+                conv = ConversationInStore(
+                    model=str(saved_model),
+                    client_id=client.id,
+                    metadata=session.metadata,
+                    messages=[*cleaned_history, last_message],
+                )
+                key = db.store(conv)
+                stream_logger.debug(f"Conversation saved to LMDB with key: {key}")
             else:
-                saved_model = model
-
-            conv = ConversationInStore(
-                model=str(saved_model),
-                client_id=client.id,
-                metadata=session.metadata,
-                messages=[*cleaned_history, last_message],
-            )
-            key = db.store(conv)
-            stream_logger.debug(f"Conversation saved to LMDB with key: {key}")
+                stream_logger.debug(
+                    "Skipped saving conversation because assistant content is empty after streaming/fallback."
+                )
         except Exception as e:
             stream_logger.warning(f"Failed to save conversation to LMDB: {e}")
 
