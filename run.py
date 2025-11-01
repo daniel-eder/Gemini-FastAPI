@@ -10,8 +10,9 @@ from app.utils import g_config, setup_logging
 app = create_app()
 
 if __name__ == "__main__":
-    # Setup loguru logging
-    setup_logging(level=g_config.logging.level)
+    # Setup loguru logging (env overrides: GEMINI_LOG_LEVEL, GEMINI_LOG_JSON)
+    json_logging = os.getenv("GEMINI_LOG_JSON", "false").lower() in {"1", "true", "yes"}
+    setup_logging(level=g_config.logging.level, json=json_logging)
 
     # Check HTTPS configuration
     if g_config.server.https.enabled:

@@ -1,4 +1,5 @@
 import uuid
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -61,6 +62,11 @@ async def create_chat_completion(
     api_key: str = Depends(verify_api_key),
     tmp_dir: Path = Depends(get_temp_dir),
 ):
+    # Correlate all logs for this request with a unique id
+    request_id = f"req-{uuid.uuid4()}"
+    req_logger = logger.bind(request_id=request_id)
+    start_time = time.perf_counter()
+
     pool = GeminiClientPool()
     db = LMDBConversationStore()
     model = Model.from_name(request.model)
@@ -71,8 +77,40 @@ async def create_chat_completion(
             detail="At least one message is required in the conversation.",
         )
 
+    # Log basic request summary (sanitized / truncated)
+    try:
+        first_user_msg = next((m for m in request.messages if m.role == "user"), None)
+        sample_text = ""
+        if first_user_msg:
+            if isinstance(first_user_msg.content, str):
+                sample_text = first_user_msg.content[:200]
+            else:
+                # collect first text fragment
+                for part in first_user_msg.content:
+                    if getattr(part, "type", "") == "text" and part.text:
+                        sample_text = part.text[:200]
+                        break
+        req_logger.debug(
+            "Incoming chat completion request",  # message
+            extra={
+                "model": request.model,
+                "stream": request.stream,
+                "messages_count": len(request.messages),
+                "first_user_sample": sample_text,
+            },
+        )
+    except Exception as e:
+        req_logger.warning(f"Failed to log request summary: {e}")
+
     # Check if conversation is reusable
     session, client, remaining_messages = _find_reusable_session(db, pool, model, request.messages)
+
+    if session:
+        req_logger.debug(
+            f"Reusable session found; remaining_messages={len(remaining_messages)} metadata={session.metadata}"
+        )
+    else:
+        req_logger.debug("No reusable session found; starting new conversation")
 
     if session:
         # Prepare the model input depending on how many turns are missing.
@@ -84,7 +122,7 @@ async def create_chat_completion(
             model_input, files = await GeminiClientWrapper.process_conversation(
                 remaining_messages, tmp_dir
             )
-        logger.debug(
+        req_logger.debug(
             f"Reused session {session.metadata} - sending {len(remaining_messages)} new messages."
         )
     else:
@@ -100,13 +138,13 @@ async def create_chat_completion(
         except Exception as e:
             logger.exception(f"Error in preparing conversation: {e}")
             raise
-        logger.debug("New session started.")
+    req_logger.debug("New session started.")
 
     # Generate response
     try:
         assert session and client, "Session and client not available"
-        logger.debug(
-            f"Client ID: {client.id}, Input length: {len(model_input)}, files count: {len(files)}"
+        req_logger.debug(
+            f"Prepared model input (length={len(model_input)} chars, files={len(files)})"
         )
 
         completion_id = f"chatcmpl-{uuid.uuid4()}"
@@ -114,7 +152,9 @@ async def create_chat_completion(
 
         if request.stream:
             # For streaming, get the stream iterator
-            stream_iterator = await _send_with_split(session, model_input, files=files, stream=True)
+            stream_iterator = await _send_with_split(
+                session, model_input, files=files, stream=True, request_id=request_id
+            )
             return _create_streaming_response(
                 stream_iterator,
                 completion_id,
@@ -124,10 +164,13 @@ async def create_chat_completion(
                 db,
                 session,
                 client,
+                request_id,
             )
         else:
             # For non-streaming, get the full response
-            response = await _send_with_split(session, model_input, files=files, stream=False)
+            response = await _send_with_split(
+                session, model_input, files=files, stream=False, request_id=request_id
+            )
 
             # Format the response from API
             model_output = GeminiClientWrapper.extract_output(response, include_thoughts=False)
@@ -151,14 +194,18 @@ async def create_chat_completion(
                 logger.debug(f"Conversation saved to LMDB with key: {key}")
             except Exception as e:
                 # We can still return the response even if saving fails
-                logger.warning(f"Failed to save conversation to LMDB: {e}")
+                req_logger.warning(f"Failed to save conversation to LMDB: {e}")
 
+            elapsed = (time.perf_counter() - start_time) * 1000
+            req_logger.debug(
+                f"Non-streaming response ready (elapsed={elapsed:.1f}ms, tokens_estimate={estimate_tokens(model_output)})"
+            )
             return _create_standard_response(
                 model_output, thoughts, completion_id, timestamp, request.model, request.messages
             )
 
     except Exception as e:
-        logger.exception(f"Error generating content from Gemini API: {e}")
+        req_logger.exception(f"Error generating content from Gemini API: {e}")
         raise
 
 
@@ -221,7 +268,11 @@ def _find_reusable_session(
 
 
 async def _send_with_split(
-    session: ChatSession, text: str, files: list[Path | str] | None = None, stream: bool = False
+    session: ChatSession,
+    text: str,
+    files: list[Path | str] | None = None,
+    stream: bool = False,
+    request_id: str | None = None,
 ):
     """Send text to Gemini, automatically splitting into multiple batches if it is
     longer than ``MAX_CHARS_PER_REQUEST``.
@@ -240,8 +291,13 @@ async def _send_with_split(
     Returns:
         Either a ModelOutput (stream=False) or an async iterator of StreamChunk (stream=True)
     """
+    bound_logger = logger.bind(request_id=request_id) if request_id else logger
+
     if len(text) <= MAX_CHARS_PER_REQUEST:
         # No need to split - a single request is fine.
+        bound_logger.debug(
+            f"Sending single request to Gemini (length={len(text)} <= max={MAX_CHARS_PER_REQUEST}, stream={stream})"
+        )
         if stream:
             return await session.send_message_stream(text, files=files)
         else:
@@ -264,14 +320,23 @@ async def _send_with_split(
         chunks.append(chunk)
 
     # Fire off all but the last chunk, discarding the interim "ok" replies.
-    for chk in chunks[:-1]:
+    bound_logger.debug(
+        f"Sending {len(chunks)} chunk(s) to Gemini (max_chars_per_request={MAX_CHARS_PER_REQUEST}, stream={stream})"
+    )
+    for i, chk in enumerate(chunks[:-1]):
         try:
+            bound_logger.debug(
+                f"Sending intermediate chunk {i+1}/{len(chunks)-1} (len={len(chk)})"
+            )
             await session.send_message(chk)
         except Exception as e:
-            logger.exception(f"Error sending chunk to Gemini: {e}")
+            bound_logger.exception(f"Error sending chunk {i+1} to Gemini: {e}")
             raise
 
     # The last chunk carries the files (if any) and we return its response.
+    bound_logger.debug(
+        f"Sending final chunk (len={len(chunks[-1])}) with files={len(files) if files else 0}" + (" (stream)" if stream else "")
+    )
     if stream:
         return await session.send_message_stream(chunks[-1], files=files)
     else:
@@ -287,6 +352,7 @@ def _create_streaming_response(
     db: LMDBConversationStore,
     session: ChatSession,
     client: GeminiClientWrapper,
+    request_id: str,
 ) -> StreamingResponse:
     """Create streaming response with `usage` calculation included in the final chunk.
     
@@ -302,6 +368,11 @@ def _create_streaming_response(
     """
 
     async def generate_stream():
+        stream_logger = logger.bind(request_id=request_id)
+        stream_start = time.perf_counter()
+        stream_logger.debug(
+            f"Starting streaming response (completion_id={completion_id}, model={model}, messages={len(messages)})"
+        )
         # Send start event
         data = {
             "id": completion_id,
@@ -317,6 +388,9 @@ def _create_streaming_response(
         full_thoughts = ""
 
         # Stream chunks from Gemini API
+        chunk_count = 0
+        total_text_chars = 0
+        total_thought_chars = 0
         try:
             async for chunk in stream_iterator:
                 # Build the delta object following OpenAI's format
@@ -326,6 +400,7 @@ def _create_streaming_response(
                 if chunk.delta_thoughts:
                     full_thoughts += chunk.delta_thoughts
                     delta["reasoning_content"] = chunk.delta_thoughts
+                    total_thought_chars += len(chunk.delta_thoughts)
                 
                 # Handle regular text content
                 if chunk.delta_text:
@@ -333,6 +408,7 @@ def _create_streaming_response(
                     formatted_text = GeminiClientWrapper.format_stream_text(chunk.delta_text)
                     delta["content"] = formatted_text
                     full_text += chunk.delta_text  # Store unformatted for token counting
+                    total_text_chars += len(chunk.delta_text)
 
                 # Send the delta if we have any content (thoughts or text)
                 if delta:
@@ -344,10 +420,21 @@ def _create_streaming_response(
                         "choices": [{"index": 0, "delta": delta, "finish_reason": None}],
                     }
                     yield f"data: {orjson.dumps(data).decode('utf-8')}\n\n"
+                    chunk_count += 1
+                    if chunk_count % 25 == 0 or chunk_count < 10:
+                        # Avoid logging every single chunk after many; sample early & every 25th
+                        stream_logger.debug(
+                            f"Stream chunk {chunk_count}: text_chars={total_text_chars} thought_chars={total_thought_chars}"
+                        )
 
         except Exception as e:
-            logger.exception(f"Error during streaming: {e}")
+            stream_logger.exception(f"Error during streaming: {e}")
             raise
+
+        if chunk_count == 0:
+            stream_logger.warning(
+                "Streaming ended with zero chunks received from upstream Gemini API. Check upstream connectivity or request formatting."
+            )
 
         # Calculate token usage
         prompt_tokens = sum(estimate_tokens(_text_from_message(msg)) for msg in messages)
@@ -374,11 +461,15 @@ def _create_streaming_response(
                 messages=[*cleaned_history, last_message],
             )
             key = db.store(conv)
-            logger.debug(f"Conversation saved to LMDB with key: {key}")
+            stream_logger.debug(f"Conversation saved to LMDB with key: {key}")
         except Exception as e:
-            logger.warning(f"Failed to save conversation to LMDB: {e}")
+            stream_logger.warning(f"Failed to save conversation to LMDB: {e}")
 
         # Send end event with usage
+        elapsed_ms = (time.perf_counter() - stream_start) * 1000
+        stream_logger.debug(
+            f"Streaming completed (chunks={chunk_count}, text_chars={total_text_chars}, thought_chars={total_thought_chars}, elapsed={elapsed_ms:.1f}ms)"
+        )
         data = {
             "id": completion_id,
             "object": "chat.completion.chunk",

@@ -74,6 +74,42 @@ python run.py
 
 The server will start on `http://localhost:8000` by default.
 
+### Enhanced Logging & Debugging
+
+You can now control logging more granularly:
+
+| Environment Variable | Values | Description |
+|----------------------|--------|-------------|
+| `GEMINI_LOG_LEVEL`   | DEBUG, INFO, WARNING, ERROR, CRITICAL | Override configured log level without editing YAML |
+| `GEMINI_LOG_JSON`    | true/false (1/0) | Emit structured JSON logs (for ingestion into log systems) |
+
+Example (PowerShell):
+
+```powershell
+$env:GEMINI_LOG_LEVEL = 'DEBUG'
+$env:GEMINI_LOG_JSON = 'true'
+uv run python run.py
+```
+
+Streaming-specific instrumentation has been added. Each request is tagged with a unique `request_id` (e.g. `req-<uuid>`). Look for these fields to correlate logs:
+
+- Request summary: input length, first user message sample
+- Session reuse decision (reused vs new)
+- Chunk splitting details (`Sending X chunk(s)` ...)
+- Intermediate streaming progress samples (every chunk up to 10 then every 25th)
+- Final streaming metrics (total chunks, chars, elapsed ms) and token usage
+- Warning if the upstream produced **zero streaming chunks** (`Streaming ended with zero chunks ...`)
+
+If you experience a 200 response with no tokens received from the client:
+
+1. Check for the zero-chunk warning in logs
+2. Ensure `GEMINI_LOG_LEVEL=DEBUG` to see chunk-splitting and upstream send events
+3. Verify cookies are still valid (look for auto-refresh logs from `gemini_webapi` if `verbose` is enabled in config)
+4. Confirm the first message actually contains user content (sample logged)
+5. Consider lowering `max_chars_per_request` in `config/config.yaml` if very large prompts stall upstream
+
+To narrow logs to a single request, filter on its `request_id`.
+
 ## Docker Deployment
 
 ### Run with Options
