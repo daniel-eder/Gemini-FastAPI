@@ -1359,6 +1359,16 @@ def _create_real_chat_streaming_response(
 
         full_text = ""
         full_thoughts = ""
+        thought_open = False
+
+        def _create_chunk(content: str):
+            return {
+                "id": completion_id,
+                "object": "chat.completion.chunk",
+                "created": created_time,
+                "model": model_name,
+                "choices": [{"index": 0, "delta": {"content": content}, "finish_reason": None}],
+            }
 
         try:
             async for chunk in iterator:
@@ -1369,25 +1379,27 @@ def _create_real_chat_streaming_response(
                 # Check for thoughts
                 delta_thoughts = getattr(cand, "delta_thoughts", "") or ""
                 if delta_thoughts:
+                    if not thought_open:
+                        yield f"data: {orjson.dumps(_create_chunk('<think>')).decode('utf-8')}\n\n"
+                        thought_open = True
+                    
                     full_thoughts += delta_thoughts
-                    # If we want to stream thoughts to client, we can decide how.
-                    # Standard OpenAI clients might ignore it or we can wrap it.
-                    # For now we don't stream thoughts as content unless user requested think tags?
-                    # The `extract_output` appends thoughts with <think> tag if requested.
-                    # Here we just buffer it for saving.
-                    pass
+                    yield f"data: {orjson.dumps(_create_chunk(delta_thoughts)).decode('utf-8')}\n\n"
 
                 delta_text = getattr(cand, "delta_text", "") or ""
                 if delta_text:
+                    if thought_open:
+                        yield f"data: {orjson.dumps(_create_chunk('</think>\n')).decode('utf-8')}\n\n"
+                        thought_open = False
+
                     full_text += delta_text
-                    data = {
-                        "id": completion_id,
-                        "object": "chat.completion.chunk",
-                        "created": created_time,
-                        "model": model_name,
-                        "choices": [{"index": 0, "delta": {"content": delta_text}, "finish_reason": None}],
-                    }
-                    yield f"data: {orjson.dumps(data).decode('utf-8')}\n\n"
+                    yield f"data: {orjson.dumps(_create_chunk(delta_text)).decode('utf-8')}\n\n"
+
+            # End of stream, check if thoughts need closing
+            if thought_open:
+                yield f"data: {orjson.dumps(_create_chunk('</think>\n')).decode('utf-8')}\n\n"
+                thought_open = False
+
         except Exception as e:
             logger.error(f"Error during streaming: {e}")
             # We can't really send an error structure in SSE easily if we already sent 200 OK
@@ -1512,23 +1524,44 @@ def _create_real_responses_streaming_response(
         yield f"data: {orjson.dumps(added_event).decode('utf-8')}\n\n"
 
         full_text = ""
-        
+        full_thoughts = ""
+        thought_open = False
+
+        def _create_delta(content: str):
+             return {
+                **base_event,
+                "type": "response.output_text.delta",
+                "output_index": i,
+                "delta": content,
+            }
+
         try:
             async for chunk in iterator:
                 if not chunk.candidates:
                     continue
                 cand = chunk.candidates[0]
+
+                delta_thoughts = getattr(cand, "delta_thoughts", "") or ""
+                if delta_thoughts:
+                    if not thought_open:
+                        yield f"data: {orjson.dumps(_create_delta('<think>')).decode('utf-8')}\n\n"
+                        thought_open = True
+                    
+                    full_thoughts += delta_thoughts
+                    yield f"data: {orjson.dumps(_create_delta(delta_thoughts)).decode('utf-8')}\n\n"
+
                 delta_text = getattr(cand, "delta_text", "") or ""
-                
                 if delta_text:
+                    if thought_open:
+                         yield f"data: {orjson.dumps(_create_delta('</think>\n')).decode('utf-8')}\n\n"
+                         thought_open = False
+
                     full_text += delta_text
-                    delta_event = {
-                        **base_event,
-                        "type": "response.output_text.delta",
-                        "output_index": i,
-                        "delta": delta_text,
-                    }
-                    yield f"data: {orjson.dumps(delta_event).decode('utf-8')}\n\n"
+                    yield f"data: {orjson.dumps(_create_delta(delta_text)).decode('utf-8')}\n\n"
+
+            if thought_open:
+                    yield f"data: {orjson.dumps(_create_delta('</think>\n')).decode('utf-8')}\n\n"
+                    thought_open = False
                     
         except Exception as e:
             logger.error(f"Error during streaming: {e}")
@@ -1543,7 +1576,14 @@ def _create_real_responses_streaming_response(
 
         # Item done with full content
         final_item = item_skeleton.copy()
-        final_item["content"] = [{"type": "output_text", "text": full_text}]
+        
+        # Combine thoughts and text for the final item content if that's what we want persistent or consistent with non-streaming
+        # extract_output typically joins them: text = "" ... if thoughts: text += <think>...
+        final_combined_text = full_text
+        if full_thoughts:
+            final_combined_text = f"<think>{full_thoughts}</think>\n{full_text}"
+            
+        final_item["content"] = [{"type": "output_text", "text": final_combined_text}]
         
         item_done_event = {
             **base_event,
@@ -1569,6 +1609,12 @@ def _create_real_responses_streaming_response(
 
         # Save to LMDB
         try:
+            # We usually store the 'clean' text (without thoughts) if we want to mimic standard assistant behavior?
+            # But the non-streaming sanitization logic seemed to use `storage_output` which removes tool calls but maybe kept thoughts?
+            # Actually line 957: assistant_text = LMDBConversationStore.remove_think_tags(visible_text.strip())
+            # So LMDB usually gets text WITHOUT think tags.
+            # So for storage we should use `full_text`.
+            
             last_message = Message(role="assistant", content=full_text or None)
             cleaned_history = db.sanitize_assistant_messages(input_messages)
             conv = ConversationInStore(
