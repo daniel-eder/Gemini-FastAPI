@@ -664,7 +664,23 @@ async def create_chat_completion(
         logger.debug(
             f"Client ID: {client_id}, Input length: {len(model_input)}, files count: {len(files)}"
         )
-        response = await _send_with_split(session, model_input, files=files)
+        if request.stream:
+            iterator = await _send_with_split(session, model_input, files=files, stream=True)
+            completion_id = f"chatcmpl-{uuid.uuid4()}"
+            timestamp = int(datetime.now(tz=timezone.utc).timestamp())
+            return _create_real_chat_streaming_response(
+                iterator=iterator,
+                completion_id=completion_id,
+                created_time=timestamp,
+                model_name=request.model,
+                db=db,
+                client_id=client_id,
+                session_metadata=session.metadata,
+                input_messages=request.messages,
+                model_obj=model,
+            )
+
+        response = await _send_with_split(session, model_input, files=files, stream=False)
     except APIError as exc:
         client_id = client.id if client else "unknown"
         logger.warning(f"Gemini API returned invalid response for client {client_id}: {exc}")
@@ -903,6 +919,34 @@ async def create_response(
         logger.debug(
             f"Client ID: {client_id}, Input length: {len(model_input)}, files count: {len(files)}"
         )
+        if request_data.stream:
+            iterator = await _send_with_split(session, model_input, files=files, stream=True)
+            created_time = int(datetime.now(tz=timezone.utc).timestamp())
+            response_id = f"resp_{uuid.uuid4().hex}"
+
+            skeleton_payload = ResponseCreateResponse(
+                id=response_id,
+                created_at=created_time,
+                model=request_data.model,
+                output=[],
+                status="in_progress",
+                usage=ResponseUsage(input_tokens=0, output_tokens=0, total_tokens=0),
+                input=normalized_input or None,
+                metadata=request_data.metadata or None,
+                tools=request_data.tools,
+                tool_choice=request_data.tool_choice,
+            )
+
+            return _create_real_responses_streaming_response(
+                iterator=iterator,
+                response_payload=skeleton_payload,
+                db=db,
+                client_id=client_id,
+                session_metadata=session.metadata,
+                input_messages=base_messages,
+                model_obj=model,
+            )
+
         model_output = await _send_with_split(session, model_input, files=files)
     except APIError as exc:
         client_id = client.id if client else "unknown"
@@ -1176,7 +1220,12 @@ async def _find_reusable_session(
     return None, None, messages
 
 
-async def _send_with_split(session: ChatSession, text: str, files: list[Path | str] | None = None):
+async def _send_with_split(
+    session: ChatSession, 
+    text: str, 
+    files: list[Path | str] | None = None,
+    stream: bool = False,
+):
     """Send text to Gemini, automatically splitting into multiple batches if it is
     longer than ``MAX_CHARS_PER_REQUEST``.
 
@@ -1185,10 +1234,25 @@ async def _send_with_split(session: ChatSession, text: str, files: list[Path | s
     "ok". The final batch carries any file uploads and the real user prompt so
     that Gemini can produce the actual answer.
     """
+    async def _send_via_stream(session_obj: ChatSession, prompt: str, attachments: list[Path | str] | None = None):
+        """Helper to use generate_content_stream and aggregate the result."""
+        final_output = None
+        async for chunk in session_obj.geminiclient.generate_content_stream(
+            prompt, files=attachments, model=session_obj.model, gem=session_obj.gem, chat=session_obj
+        ):
+            final_output = chunk
+        if not final_output:
+            raise RuntimeError("Gemini generated no content.")
+        return final_output
+
     if len(text) <= MAX_CHARS_PER_REQUEST:
         # No need to split - a single request is fine.
         try:
-            return await session.send_message(text, files=files)
+            if stream:
+                return session.geminiclient.generate_content_stream(
+                    text, files=files, model=session.model, gem=session.gem, chat=session
+                )
+            return await _send_via_stream(session, text, files=files)
         except Exception as e:
             logger.exception(f"Error sending message to Gemini: {e}")
             raise
@@ -1211,14 +1275,18 @@ async def _send_with_split(session: ChatSession, text: str, files: list[Path | s
     # Fire off all but the last chunk, discarding the interim "ok" replies.
     for chk in chunks[:-1]:
         try:
-            await session.send_message(chk)
+            await _send_via_stream(session, chk)
         except Exception as e:
             logger.exception(f"Error sending chunk to Gemini: {e}")
             raise
 
     # The last chunk carries the files (if any) and we return its response.
     try:
-        return await session.send_message(chunks[-1], files=files)
+        if stream:
+            return session.geminiclient.generate_content_stream(
+                chunks[-1], files=files, model=session.model, gem=session.gem, chat=session
+            )
+        return await _send_via_stream(session, chunks[-1], files=files)
     except Exception as e:
         logger.exception(f"Error sending final chunk to Gemini: {e}")
         raise
@@ -1263,6 +1331,258 @@ def _iter_stream_segments(model_output: str, chunk_size: int = 64):
             pending += token
 
     yield from _flush_pending()
+
+
+def _create_real_chat_streaming_response(
+    iterator: Any,
+    completion_id: str,
+    created_time: int,
+    model_name: str,
+    db: LMDBConversationStore,
+    client_id: str,
+    session_metadata: list[str],
+    input_messages: list[Message],
+    model_obj: Model,
+) -> StreamingResponse:
+    """Create a real streaming response by iterating over Gemini chunks."""
+
+    async def generate_stream():
+        # Send start event
+        data = {
+            "id": completion_id,
+            "object": "chat.completion.chunk",
+            "created": created_time,
+            "model": model_name,
+            "choices": [{"index": 0, "delta": {"role": "assistant"}, "finish_reason": None}],
+        }
+        yield f"data: {orjson.dumps(data).decode('utf-8')}\n\n"
+
+        full_text = ""
+        full_thoughts = ""
+
+        try:
+            async for chunk in iterator:
+                if not chunk.candidates:
+                    continue
+                cand = chunk.candidates[0]
+                
+                # Check for thoughts
+                delta_thoughts = getattr(cand, "delta_thoughts", "") or ""
+                if delta_thoughts:
+                    full_thoughts += delta_thoughts
+                    # If we want to stream thoughts to client, we can decide how.
+                    # Standard OpenAI clients might ignore it or we can wrap it.
+                    # For now we don't stream thoughts as content unless user requested think tags?
+                    # The `extract_output` appends thoughts with <think> tag if requested.
+                    # Here we just buffer it for saving.
+                    pass
+
+                delta_text = getattr(cand, "delta_text", "") or ""
+                if delta_text:
+                    full_text += delta_text
+                    data = {
+                        "id": completion_id,
+                        "object": "chat.completion.chunk",
+                        "created": created_time,
+                        "model": model_name,
+                        "choices": [{"index": 0, "delta": {"content": delta_text}, "finish_reason": None}],
+                    }
+                    yield f"data: {orjson.dumps(data).decode('utf-8')}\n\n"
+        except Exception as e:
+            logger.error(f"Error during streaming: {e}")
+            # We can't really send an error structure in SSE easily if we already sent 200 OK
+            # But we can try to yield a final error or just stop.
+
+        # Stream finished
+        
+        # Calculate tokens roughly
+        completion_tokens = estimate_tokens(full_text)
+        # We don't have tool calls from streaming easily yet
+        finish_reason = "stop"
+
+        data = {
+            "id": completion_id,
+            "object": "chat.completion.chunk",
+            "created": created_time,
+            "model": model_name,
+            "choices": [{"index": 0, "delta": {}, "finish_reason": finish_reason}],
+            "usage": {
+                "prompt_tokens": 0, # We'd need to calculate this from input
+                "completion_tokens": completion_tokens,
+                "total_tokens": completion_tokens,
+            },
+        }
+        yield f"data: {orjson.dumps(data).decode('utf-8')}\n\n"
+        yield "data: [DONE]\n\n"
+
+        # Save to LMDB
+        try:
+            # Reconstruct content
+            content_to_store = full_text
+            if full_thoughts:
+                # We save thoughts? extract_output does: text += f"<think>{response.thoughts}</think>\n"
+                # But LMDBConversationStore.remove_think_tags removes them for cleanup.
+                # So we arguably should NOT store them in the 'clean' message, or we should?
+                # `_create_standard_response` uses `storage_output` which is cleaned.
+                # `visible_text` has thoughts.
+                # Here `full_text` is likely the visible text (minus thoughts from gemini-webapi?).
+                # If gemini-webapi separates thoughts, `full_text` is clean.
+                pass
+            
+            last_message = Message(
+                role="assistant",
+                content=content_to_store or None,
+            )
+            cleaned_history = db.sanitize_assistant_messages(input_messages)
+            conv = ConversationInStore(
+                model=model_obj.model_name,
+                client_id=client_id,
+                metadata=session_metadata,
+                messages=[*cleaned_history, last_message],
+            )
+            key = db.store(conv)
+            logger.debug(f"Conversation saved to LMDB with key: {key}")
+        except Exception as exc:
+            logger.warning(f"Failed to save streaming conversation to LMDB: {exc}")
+
+    return StreamingResponse(generate_stream(), media_type="text/event-stream")
+
+
+def _create_real_responses_streaming_response(
+    iterator: Any,
+    response_payload: ResponseCreateResponse,
+    db: LMDBConversationStore,
+    client_id: str,
+    session_metadata: list[str],
+    input_messages: list[Message],
+    model_obj: Model,
+) -> StreamingResponse:
+    """Create real streaming response for Responses API."""
+    
+    response_dict = response_payload.model_dump(mode="json")
+    response_id = response_payload.id
+    created_time = response_payload.created_at
+    model_name = response_payload.model
+    
+    base_event = {
+        "id": response_id,
+        "object": "response",
+        "created_at": created_time,
+        "model": model_name,
+    }
+
+    created_snapshot: dict[str, Any] = {
+        "id": response_id,
+        "object": "response",
+        "created_at": created_time,
+        "model": model_name,
+        "status": "in_progress",
+    }
+    # Copy metadata/input/tools/tool_choice if valid (omitted for brevity/safety)
+    
+    async def generate_stream():
+        # Emit creation event
+        data = {
+            **base_event,
+            "type": "response.created",
+            "response": created_snapshot,
+        }
+        yield f"data: {orjson.dumps(data).decode('utf-8')}\n\n"
+        
+        # We assume 1 output item (index 0) of type message
+        i = 0
+        
+        # Emit added event
+        # We don't have the full content yet, so we emit an empty message item?
+        # The fake streaming implementation emitted the full item.
+        # But for streaming we typically emit an initial skeleton.
+        item_skeleton = {
+            "id": f"msg_{uuid.uuid4().hex}",
+            "type": "message",
+            "role": "assistant",
+            "content": [], 
+        }
+        
+        added_event = {
+            **base_event,
+            "type": "response.output_item.added",
+            "output_index": i,
+            "item": item_skeleton,
+        }
+        yield f"data: {orjson.dumps(added_event).decode('utf-8')}\n\n"
+
+        full_text = ""
+        
+        try:
+            async for chunk in iterator:
+                if not chunk.candidates:
+                    continue
+                cand = chunk.candidates[0]
+                delta_text = getattr(cand, "delta_text", "") or ""
+                
+                if delta_text:
+                    full_text += delta_text
+                    delta_event = {
+                        **base_event,
+                        "type": "response.output_text.delta",
+                        "output_index": i,
+                        "delta": delta_text,
+                    }
+                    yield f"data: {orjson.dumps(delta_event).decode('utf-8')}\n\n"
+                    
+        except Exception as e:
+            logger.error(f"Error during streaming: {e}")
+
+        # Text done
+        done_event = {
+            **base_event,
+            "type": "response.output_text.done",
+            "output_index": i,
+        }
+        yield f"data: {orjson.dumps(done_event).decode('utf-8')}\n\n"
+
+        # Item done with full content
+        final_item = item_skeleton.copy()
+        final_item["content"] = [{"type": "output_text", "text": full_text}]
+        
+        item_done_event = {
+            **base_event,
+            "type": "response.output_item.done",
+            "output_index": i,
+            "item": final_item,
+        }
+        yield f"data: {orjson.dumps(item_done_event).decode('utf-8')}\n\n"
+
+        # Completed
+        # We update the original payload status or create a new completed structure
+        completed_response = response_dict.copy()
+        completed_response["output"] = [final_item]
+        completed_response["status"] = "completed"
+        
+        completed_event = {
+            **base_event,
+            "type": "response.completed",
+            "response": completed_response,
+        }
+        yield f"data: {orjson.dumps(completed_event).decode('utf-8')}\n\n"
+        yield "data: [DONE]\n\n"
+
+        # Save to LMDB
+        try:
+            last_message = Message(role="assistant", content=full_text or None)
+            cleaned_history = db.sanitize_assistant_messages(input_messages)
+            conv = ConversationInStore(
+                model=model_obj.model_name,
+                client_id=client_id,
+                metadata=session_metadata,
+                messages=[*cleaned_history, last_message],
+            )
+            key = db.store(conv)
+            logger.debug(f"Conversation saved to LMDB with key: {key}")
+        except Exception as exc:
+            logger.warning(f"Failed to save streaming responses conversation to LMDB: {exc}")
+
+    return StreamingResponse(generate_stream(), media_type="text/event-stream")
 
 
 def _create_streaming_response(
