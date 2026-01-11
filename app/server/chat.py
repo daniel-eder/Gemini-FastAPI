@@ -701,6 +701,7 @@ async def create_chat_completion(
     try:
         raw_output_with_think = GeminiClientWrapper.extract_output(response, include_thoughts=True)
         raw_output_clean = GeminiClientWrapper.extract_output(response, include_thoughts=False)
+        thoughts = getattr(response, "thoughts", None)
     except IndexError as exc:
         logger.exception("Gemini output parsing failed (IndexError).")
         raise HTTPException(
@@ -714,7 +715,7 @@ async def create_chat_completion(
             detail="Gemini output parsing failed unexpectedly.",
         ) from exc
 
-    visible_output, tool_calls = _extract_tool_calls(raw_output_with_think)
+    visible_output, tool_calls = _extract_tool_calls(raw_output_clean)
     storage_output = _remove_tool_call_blocks(raw_output_clean).strip()
     tool_calls_payload = [call.model_dump(mode="json") for call in tool_calls]
 
@@ -784,6 +785,7 @@ async def create_chat_completion(
             timestamp,
             request.model,
             request.messages,
+            thoughts,
         )
 
 
@@ -1150,9 +1152,6 @@ async def create_response(
         return _create_responses_streaming_response(response_payload, assistant_text or "")
 
     return response_payload
-
-
-def _text_from_message(message: Message) -> str:
     """Return text content from a message for token estimation."""
     base_text = ""
     if isinstance(message.content, str):
@@ -1359,16 +1358,6 @@ def _create_real_chat_streaming_response(
 
         full_text = ""
         full_thoughts = ""
-        thought_open = False
-
-        def _create_chunk(content: str):
-            return {
-                "id": completion_id,
-                "object": "chat.completion.chunk",
-                "created": created_time,
-                "model": model_name,
-                "choices": [{"index": 0, "delta": {"content": content}, "finish_reason": None}],
-            }
 
         try:
             async for chunk in iterator:
@@ -1376,29 +1365,28 @@ def _create_real_chat_streaming_response(
                     continue
                 cand = chunk.candidates[0]
                 
+                delta = {}
+
                 # Check for thoughts
                 delta_thoughts = getattr(cand, "delta_thoughts", "") or ""
                 if delta_thoughts:
-                    if not thought_open:
-                        yield f"data: {orjson.dumps(_create_chunk('<think>')).decode('utf-8')}\n\n"
-                        thought_open = True
-                    
                     full_thoughts += delta_thoughts
-                    yield f"data: {orjson.dumps(_create_chunk(delta_thoughts)).decode('utf-8')}\n\n"
+                    delta["reasoning_content"] = delta_thoughts
 
                 delta_text = getattr(cand, "delta_text", "") or ""
                 if delta_text:
-                    if thought_open:
-                        yield f"data: {orjson.dumps(_create_chunk('</think>\n')).decode('utf-8')}\n\n"
-                        thought_open = False
-
                     full_text += delta_text
-                    yield f"data: {orjson.dumps(_create_chunk(delta_text)).decode('utf-8')}\n\n"
-
-            # End of stream, check if thoughts need closing
-            if thought_open:
-                yield f"data: {orjson.dumps(_create_chunk('</think>\n')).decode('utf-8')}\n\n"
-                thought_open = False
+                    delta["content"] = delta_text
+                
+                if delta:
+                    data = {
+                        "id": completion_id,
+                        "object": "chat.completion.chunk",
+                        "created": created_time,
+                        "model": model_name,
+                        "choices": [{"index": 0, "delta": delta, "finish_reason": None}],
+                    }
+                    yield f"data: {orjson.dumps(data).decode('utf-8')}\n\n"
 
         except Exception as e:
             logger.error(f"Error during streaming: {e}")
@@ -1431,15 +1419,7 @@ def _create_real_chat_streaming_response(
         try:
             # Reconstruct content
             content_to_store = full_text
-            if full_thoughts:
-                # We save thoughts? extract_output does: text += f"<think>{response.thoughts}</think>\n"
-                # But LMDBConversationStore.remove_think_tags removes them for cleanup.
-                # So we arguably should NOT store them in the 'clean' message, or we should?
-                # `_create_standard_response` uses `storage_output` which is cleaned.
-                # `visible_text` has thoughts.
-                # Here `full_text` is likely the visible text (minus thoughts from gemini-webapi?).
-                # If gemini-webapi separates thoughts, `full_text` is clean.
-                pass
+            # Thoughts are typically not stored in the main message content for standard history
             
             last_message = Message(
                 role="assistant",
@@ -1527,10 +1507,10 @@ def _create_real_responses_streaming_response(
         full_thoughts = ""
         thought_open = False
 
-        def _create_delta(content: str):
+        def _create_delta(content: str, event_type: str = "response.output_text.delta"):
              return {
                 **base_event,
-                "type": "response.output_text.delta",
+                "type": event_type,
                 "output_index": i,
                 "delta": content,
             }
@@ -1543,26 +1523,14 @@ def _create_real_responses_streaming_response(
 
                 delta_thoughts = getattr(cand, "delta_thoughts", "") or ""
                 if delta_thoughts:
-                    if not thought_open:
-                        yield f"data: {orjson.dumps(_create_delta('<think>')).decode('utf-8')}\n\n"
-                        thought_open = True
-                    
-                    full_thoughts += delta_thoughts
-                    yield f"data: {orjson.dumps(_create_delta(delta_thoughts)).decode('utf-8')}\n\n"
+                    # Using reasoning_text.delta for thoughts as requested
+                    yield f"data: {orjson.dumps(_create_delta(delta_thoughts, event_type='response.reasoning_text.delta')).decode('utf-8')}\n\n"
 
                 delta_text = getattr(cand, "delta_text", "") or ""
                 if delta_text:
-                    if thought_open:
-                         yield f"data: {orjson.dumps(_create_delta('</think>\n')).decode('utf-8')}\n\n"
-                         thought_open = False
-
                     full_text += delta_text
                     yield f"data: {orjson.dumps(_create_delta(delta_text)).decode('utf-8')}\n\n"
 
-            if thought_open:
-                    yield f"data: {orjson.dumps(_create_delta('</think>\n')).decode('utf-8')}\n\n"
-                    thought_open = False
-                    
         except Exception as e:
             logger.error(f"Error during streaming: {e}")
 
@@ -1820,6 +1788,7 @@ def _create_standard_response(
     created_time: int,
     model: str,
     messages: list[Message],
+    thoughts: str | None = None,
 ) -> dict:
     """Create standard response"""
     # Calculate token usage
@@ -1832,6 +1801,8 @@ def _create_standard_response(
     message_payload: dict = {"role": "assistant", "content": model_output or None}
     if tool_calls:
         message_payload["tool_calls"] = tool_calls
+    if thoughts:
+        message_payload["reasoning_content"] = thoughts
 
     result = {
         "id": completion_id,
